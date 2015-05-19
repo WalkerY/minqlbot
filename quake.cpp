@@ -90,9 +90,13 @@ const char PATTERN_INITSMALLZONEMEMORY[]  = "\x6A\x01\x68\x00\x00\x08\x00\xC7\x0
 const char MASK_INITSMALLZONEMEMORY[]     = "XXXXXXXXX----XXXXXX----XXXX";
 const int OFFSET_INITSMALLZONEMEMORY      = 0x0;
 
+// TODO: if new approach works zfree code can be removed as unnecessary making code simpler and more reliable
 const char PATTERN_ZFREE[]                = "\x55\x8B\xEC\x53\x8B\x5D\x08\x56\x57\x85\xDB\x75\x0F\x68\x00\x00\x00\x00\x6A\x01\xE8";
 const char MASK_ZFREE[]                   = "XXXXXXXXXXXXXX----XXX";
 const int OFFSET_ZFREE                    = 0x0;
+
+// TODO: Needs to be checked if ZONEID has the same value in QL as in Q3. If not Pattern matching might be the best solution.
+const UINT32 ZONEID						  = 0x1d4a11;
 
 namespace quake {
 clientConnection_t * clc;
@@ -637,6 +641,7 @@ void HandlePythonCommand(const std::vector<std::string> &args) {
   }
 }
 
+// TODO: Remove "temporary solutions" as commented below after code cleanup
 void HandleMemleakFix(const std::vector<std::string> &args) {
   // If old_smallzone has been set, we've already done this once.
   if (old_smallzone != NULL) {
@@ -644,20 +649,56 @@ void HandleMemleakFix(const std::vector<std::string> &args) {
     return;
   }
 
-  // Allocate 50 MB to new small zone then replace the old pointer.
-  DOUT << "Old smallzone: " << (void *)*smallzone << " - Size: " << float((*smallzone)->size) / (1024 * 1024) << " MB" << std::endl;
+  DOUT << "Smallzone: " << (void *)*smallzone << " - old size: " << float((*smallzone)->size) / (1024 * 1024) << " MB" << std::endl;
   size_t new_size = 512 * 1024 * 100;
-    memzone_t * new_zone = (memzone_t *)InitNewSmallZoneMemory(new_size);
+  
+  // I leave those lines as a "temporary solution" before code cleanup.
+  // TEMPORARY TRANSITION SOLUTION BEGINS
+  memzone_t * new_zone = (memzone_t *)InitNewSmallZoneMemory(new_size);
   if (new_zone == NULL) {
     OConsolePrint("^7Failed to allocate 50 MB!\n");
     return;
   }
-
+  
   old_smallzone = *smallzone;
   *smallzone = new_zone;
-  *smallzonetotal = new_size;
-  OConsolePrint("^7Success!\n");
-  DOUT << "New smallzone: " << (void *)*smallzone << " - Size: " << float((*smallzone)->size) / (1024 * 1024) << " MB" << std::endl;
+  // TEMPORARY TRANSITION SOLUTION ENDS
+  
+  // NEW SOLUTION BEGINS
+  memzone_t *zone = *smallzone;
+  
+  // Find ANY free block:
+  memblock_t	*start, *rover, *base, *new_block;
+  
+  base = rover = zone->rover;
+  start = base->prev;
+  do {
+    if (rover == start) {
+	  OConsolePrint("^7Failed!\n"); // no free blocks
+	  return;
+	}
+	if (rover->tag) {
+	  base = rover = rover->next;
+    } else {
+      rover = rover->next;
+    }
+  } while base->tag;
+  
+  // Found block, now we calc new_block_size and inflate block
+  // Because the inflated block data will be unusable but allocated we dont exclude it (unless sb. improves InflateBlock as suggested therein)
+  size_t new_block_size = new_size - zone->size;
+  new_block_size = (new_block_size + 3) & ~3; // align to 32 bit boundary
+  
+  new_block = (memblock_t *)InflateBlock(base, new_block_size);
+  DOUT << "New block: " << (void *)new_block << " - size: " << float(new_block->size) / (1024 * 1024) << " MB" << std::endl;
+  // NEW SOLUTION ENDS
+  
+  if (new_block != NULL) OConsolePrint("^7Success!\n");
+  else {
+    OConsolePrint("^7Failed!\n");
+	return;
+  }
+  DOUT << "Smallzone: " << (void *)*smallzone << " - new size: " << float((*smallzone)->size) / (1024 * 1024) << " MB" << std::endl;
 }
 
 void HandleExit(const std::vector<std::string> &args) {
@@ -804,6 +845,7 @@ void HConsolePrint(const char * msg) {
   OConsolePrint(msg);
 }
 
+// TODO: this function can be removed with new approach as I dont do total cleanup I left it for now, it should work fine
 void HZFree(void * ptr) {
   // If we've replaced the smallzone with a new one, we want to redirect
   // calls to Z_Free for allocations on the old smallzone, otherwise the
@@ -890,44 +932,63 @@ python::dict GetConfigstringRange(UINT32 i, UINT32 j) {
   }
 
   return res;
+
 }
 
-// Allocate memory for a new and larger small zone, copy the old into it, then replace
-// the global pointer that QL uses with the new one. Finally it fixes all its old pointers
-// so that they point to the new copied structure. Returns the address of the new zone,
-// or NULL if the allocation failed.
+// Temporary solution before code cleanup
 void * InitNewSmallZoneMemory(size_t new_size) {
-  memzone_t * old_zone = *smallzone;
-  memzone_t * new_zone = (memzone_t *)calloc(new_size, 1);
+  return *smallzone;
+}
 
-  if (new_size == NULL) return NULL;
+// Inflate the block to new_size to increase the whole zone capacity
+// TODO: Restore lost memory in old block by placing there another new free block
+// TODO: Consider freeing new block code. Does QL free small zone at any time? Perhaps not. Old block does not need freeing _by bot_ for sure.
+// TODO: Remove "temporary solutions" as commented below
+void *InflateBlock(const memblock_t *block, const size_t new_size) {
+  // Allocate memory for inflated block
+  memblock_t *new_block = (memblock_t *)calloc(new_size, 1); 
+    
+  memzone_t *zone = *smallzone;
 
-  memcpy(new_zone, old_zone, old_zone->size);
-  // Update new size.
-  new_zone->size = new_size;
-
-  // Update pointers. First off, calculate the offset between new and old zones.
-  new_old_offset = (unsigned int)new_zone - (unsigned int)old_zone;
-  // The zone has just one pointer, the rover.
-  new_zone->rover = (memblock_t *)((unsigned int)new_zone->rover + new_old_offset);
-  // Rover's size also need to be increased.
-  int used_space = old_zone->size - new_zone->rover->size;
-  new_zone->rover->size = new_size - used_space;
-  // Block list is a block itself, so we got two pointers.
-  new_zone->blocklist.next = (memblock_t *)((unsigned int)new_zone->blocklist.next + new_old_offset);
-  new_zone->blocklist.prev = (memblock_t *)((unsigned int)new_zone->blocklist.prev + new_old_offset);
-
-  for (memblock_t * block = new_zone->blocklist.next;; block = block->next) {
-    // Blocks have a doubly linked list, so we traverse and update the pointers.
-    block->next = (memblock_t *)((unsigned int)block->next + new_old_offset);
-    block->prev = (memblock_t *)((unsigned int)block->prev + new_old_offset);
-
-    if (block->next == &new_zone->blocklist) {
-      break;			// all blocks have been hit	
-    }
+  // Check for errors
+  if (new_size == NULL || block == NULL) {
+	DOUT << "InflateBlock: new size or block NULL" << std::endl;  
+	return NULL;
   }
+  
+  if (block->tag != 0 || block->id != ZONEID) { // Actually it doesnt need to be free block but its more elegant and we dont need to copy block data
+    DOUT << "InflateBlock: invalid source block" << std::endl;  
+	return NULL;
+  }
+  
+  if (new_block == NULL) {
+	DOUT << "InflateBlock: memory allocation for new block failed." << std:endl;
+	return NULL;
+  }
+  
+  // Configure new block
+  memcpy(new_block, block, sizeof(memblock_t)); // no need to copy block data as we deal with free block
+  new_block->size = new_size;
+  // Add marker for memory trash testing
+  *(int *)((byte *)new_block + new_block->size - 4) = ZONEID;
+  
+  // Adjust pointers in neighbours of block to point to new_block
+  block->prev->next = new_block;
+  block->next->prev = new_block;
 
-  return new_zone;
+  // Adjust small zone configuration
+  if (zone->rover == block) zone->rover = new_block;
+  zone->size += new_block->size - block->size;
+  
+  // Adjust global small zone total. WARNING: I assumed it modifies constant total that is used to initialize small zone in QL
+  *smallzonetotal = zone->size;
+  
+  // Temporary solution:
+  new_old_offset = 0;
+
+  DOUT << "InflateBlock: completed." << std:endl;
+  
+  return new_block;
 }
 
 }; // namespace quake
